@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+import logging
 
 """
 shared SPDY infrastructure
@@ -73,6 +74,7 @@ FLAG_NONE = 0x00
 FLAG_FIN = 0x01
 FLAG_UNIDIRECTIONAL = 0x02
 
+PRIORITY_MASK = 0xc0
 STREAM_MASK = 0x7fffffff
 
 class SpdyMessageHandler:
@@ -155,13 +157,14 @@ class SpdyMessageHandler:
                     stream_id = self._input_stream_id # for FLAG_FIN below
                 elif self._input_frame_type in [CTL_SYN_STREAM, CTL_SYN_REPLY]:
                     stream_id = struct.unpack("!I", frame_data[:4])[0] & STREAM_MASK # FIXME: what if they lied about the frame len?
+                    stream_priority = (struct.unpack("!b", frame_data[8:9])[0] & PRIORITY_MASK) >> 6
                     tuple_pos = 4 + 2
                     if self._input_frame_type == CTL_SYN_STREAM:
                       associated_stream_id = struct.unpack("!I", frame_data[4:8])[0]
                       tuple_pos += 4
                     hdr_tuples = self._parse_hdrs(frame_data[tuple_pos:]) or self._input_error(stream_id, 1) # FIXME: proper error here
                     # FIXME: expose pri
-                    self._input_start(stream_id, hdr_tuples)
+                    self._input_start(stream_id, stream_priority, hdr_tuples)
                 elif self._input_frame_type == CTL_RST_STREAM:
                     stream_id = struct.unpack("!I", frame_data[:4])[0] & STREAM_MASK
                     self._input_end(stream_id)
@@ -188,7 +191,8 @@ class SpdyMessageHandler:
     def _parse_hdrs(self, data):
         "Given a control frame data block, return a list of (name, value) tuples."
         # TODO: separate null-delimited into separate instances
-        data = self._decompress(data) # FIXME: catch errors
+        if self._decompress != dummy:
+          data = self._decompress(data) # FIXME: catch errors
         cursor = 2
         (num_hdrs,) = struct.unpack("!h", data[:cursor]) # FIXME: catch errors
         hdrs = []
@@ -225,7 +229,10 @@ class SpdyMessageHandler:
 
     def _ser_syn_frame(self, type, flags, stream_id, hdr_tuples):
         "Returns a SPDY SYN_[STREAM|REPLY] frame."
-        hdrs = self._compress(self._ser_hdrs(hdr_tuples))
+        #print "frame: " + str(self._ser_hdrs(hdr_tuples))
+        hdrs = self._ser_hdrs(hdr_tuples)
+        if self._compress != dummy:
+          hdrs = self._compress(hdrs)
         if (type == CTL_SYN_STREAM):
           data = struct.pack("!IIH%ds" % len(hdrs),
               STREAM_MASK & stream_id,
@@ -268,8 +275,15 @@ class SpdyMessageHandler:
         # TODO: collapse dups into null-delimited
         hdr_tuples.sort() # required by Chromium
         fmt = ["!H"]
-        args = [len(hdr_tuples)]
+        # filter junk from hdr_tuples
+        broken = 0
         for (n,v) in hdr_tuples:
+            if len(n) == 0 or len(v) == 0:
+                broken += 1
+        args = [len(hdr_tuples) - broken]
+        for (n,v) in hdr_tuples:
+            if len(n) == 0 or len(v) == 0:
+                continue
             # TODO: check for overflowing n, v lengths
             fmt.append("H%dsH%ds" % (len(n), len(v)))
             args.extend([len(n), n, len(v), v])

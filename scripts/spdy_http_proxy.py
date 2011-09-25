@@ -27,6 +27,7 @@ class ProxyClient(Client):
 
 def proxy_handler(method, uri, req_hdrs, s_res_start, req_pause):
     # can modify method, uri, req_hdrs here
+    print uri
     if backend_authority:
         (scheme, authority, path, query, fragid) = urlsplit(uri)
         uri = urlunsplit((scheme, backend_authority, path, query, fragid))
@@ -49,5 +50,5 @@ if __name__ == "__main__":
         backend_authority = sys.argv[2]
     except IndexError:
         backend_authority = None
-    server = SpdyServer('', port, proxy_handler)
+    server = SpdyServer('', port, True, 'server.crt', 'server.key', proxy_handler)
     run()
