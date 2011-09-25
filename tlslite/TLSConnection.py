@@ -931,7 +931,8 @@ class TLSConnection(TLSRecordLayer):
 
     def handshakeServer(self, sharedKeyDB=None, verifierDB=None,
                         certChain=None, privateKey=None, reqCert=False,
-                        sessionCache=None, settings=None, checker=None):
+                        sessionCache=None, settings=None, checker=None,
+                        nextProtos = None):
         """Perform a handshake in the role of server.
 
         This function performs an SSL or TLS handshake.  Depending on
@@ -1006,13 +1007,14 @@ class TLSConnection(TLSRecordLayer):
         """
         for result in self.handshakeServerAsync(sharedKeyDB, verifierDB,
                 certChain, privateKey, reqCert, sessionCache, settings,
-                checker):
+                checker, nextProtos):
             pass
 
 
     def handshakeServerAsync(self, sharedKeyDB=None, verifierDB=None,
                              certChain=None, privateKey=None, reqCert=False,
-                             sessionCache=None, settings=None, checker=None):
+                             sessionCache=None, settings=None, checker=None,
+                             nextProtos=None):
         """Start a server handshake operation on the TLS connection.
 
         This function returns a generator which behaves similarly to
@@ -1028,14 +1030,15 @@ class TLSConnection(TLSRecordLayer):
             sharedKeyDB=sharedKeyDB,
             verifierDB=verifierDB, certChain=certChain,
             privateKey=privateKey, reqCert=reqCert,
-            sessionCache=sessionCache, settings=settings)
+            sessionCache=sessionCache, settings=settings,
+            nextProtos=nextProtos)
         for result in self._handshakeWrapperAsync(handshaker, checker):
             yield result
 
 
     def _handshakeServerAsyncHelper(self, sharedKeyDB, verifierDB,
                              certChain, privateKey, reqCert, sessionCache,
-                             settings):
+                             settings, nextProtos):
 
         self._handshakeStart(client=False)
 
@@ -1240,6 +1243,9 @@ class TLSConnection(TLSRecordLayer):
         else:
             sessionID = createByteArraySequence([])
 
+        if not clientHello.supports_npn:
+            nextProtos = None
+
         #If we've selected an SRP suite, exchange keys and calculate
         #premaster secret:
         if cipherSuite in CipherSuite.srpSuites + CipherSuite.srpRsaSuites:
@@ -1336,6 +1342,7 @@ class TLSConnection(TLSRecordLayer):
             serverHello = ServerHello()
             serverHello.create(self.version, serverRandom, sessionID,
                                cipherSuite, certificateType)
+            serverHello.next_protos_advertised = nextProtos
             msgs.append(serverHello)
             if cipherSuite in CipherSuite.srpRsaSuites:
                 certificateMsg = Certificate(certificateType)
@@ -1377,8 +1384,9 @@ class TLSConnection(TLSRecordLayer):
             #Send ServerHello, Certificate[, CertificateRequest],
             #ServerHelloDone
             msgs = []
-            msgs.append(ServerHello().create(self.version, serverRandom,
-                        sessionID, cipherSuite, certificateType))
+            serverHello = ServerHello().create(self.version, serverRandom, sessionID, cipherSuite, certificateType)
+            serverHello.next_protos_advertised = nextProtos
+            msgs.append(serverHello)
             msgs.append(Certificate(certificateType).create(serverCertChain))
             if reqCert:
                 msgs.append(CertificateRequest())
@@ -1504,7 +1512,7 @@ class TLSConnection(TLSRecordLayer):
                                settings.cipherImplementations)
 
         #Exchange ChangeCipherSpec and Finished messages
-        for result in self._getFinished():
+        for result in self._getFinished(expect_next_protocol=nextProtos is not None):
             yield result
 
         #If we were holding a post-finished error until receiving the client
