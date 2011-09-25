@@ -2,6 +2,7 @@ This is an experimental source tree that aims to provide a working SPDY-HTTP rev
 
 * Mark Nottingham: https://github.com/mnot/nbhttp
 * Mike Belshe: https://github.com/mbelshe/nbhttp
-* Quinn Slack: https://github.com/sqs/tlslite
+* Quinn Slack: https://github.com/sqs/tlslite (RFC compliance and hashlib updates)
+* Adam Langley: NPN patches to tlslite
 
 The place to get things going is scripts/spdy_http_proxy.py
