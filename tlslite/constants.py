@@ -16,6 +16,7 @@ class HandshakeType:
     certificate_verify = 15
     client_key_exchange = 16
     finished = 20
+    next_protocol = 67
 
 class ContentType:
     change_cipher_spec = 20

@@ -121,9 +121,11 @@ class ClientHello(HandshakeMsg):
         self.certificate_types = [CertificateType.x509]
         self.compression_methods = []   # a list of 8-bit values
         self.srp_username = None        # a string
+        self.supports_npn = False
 
     def create(self, version, random, session_id, cipher_suites,
-               certificate_types=None, srp_username=None):
+               certificate_types=None, srp_username=None,
+               supports_npn = False):
         self.client_version = version
         self.random = random
         self.session_id = session_id
@@ -131,6 +133,7 @@ class ClientHello(HandshakeMsg):
         self.certificate_types = certificate_types
         self.compression_methods = [0]
         self.srp_username = srp_username
+        self.supports_npn = supports_npn # our Google friends missed this one...
         return self
 
     def parse(self, p):
@@ -165,6 +168,8 @@ class ClientHello(HandshakeMsg):
                         self.srp_username = bytesToString(p.getVarBytes(1))
                     elif extType == 7:
                         self.certificate_types = p.getVarList(1, 1)
+                    elif extType == 13172:
+                        self.supports_npn = True
                     else:
                         p.getFixBytes(extLength)
                     soFar += 4 + extLength
@@ -201,6 +206,13 @@ class ClientHello(HandshakeMsg):
 
         return HandshakeMsg.postWrite(self, w, trial)
 
+class BadNextProtos(Exception):
+    def __init__(self, 1):
+        self.length = 1
+
+    def __str__(self):
+        return 'Cannot encode a list of next protocols because it contains an element with invalid length %d. Element lengths must be 0 < x < 256' % self.length
+
 
 class ServerHello(HandshakeMsg):
     def __init__(self):
@@ -211,6 +223,7 @@ class ServerHello(HandshakeMsg):
         self.cipher_suite = 0
         self.certificate_type = CertificateType.x509
         self.compression_method = 0
+        self.next_protos_advertised = None
 
     def create(self, version, random, session_id, cipher_suite,
                certificate_type):
@@ -243,6 +256,16 @@ class ServerHello(HandshakeMsg):
         p.stopLengthCheck()
         return self
 
+    def __next_protos_encoded(self):
+        a = []
+        for e in self.next_protos_advertised:
+            if len(e) > 255 or len(e) == 0:
+                raise BadNextProtos(len(e))
+            a.append(chr(len(e)))
+            a.append(e)
+
+        return [ord(x) for x in ''.join(a)]
+
     def write(self, trial=False):
         w = HandshakeMsg.preWrite(self, HandshakeType.server_hello, trial)
         w.add(self.server_version[0], 1)
@@ -257,6 +280,11 @@ class ServerHello(HandshakeMsg):
                 CertificateType.x509:
             extLength += 5
 
+        encoded_next_protos_advertised = None
+        if self.next_protos_advertised is not None:
+            encoded_next_protos_advertised = self.__next_protos_encoded()
+            extLength += len(encoded_next_protos_advertised)
+
         if extLength != 0:
             w.add(extLength, 2)
 
@@ -265,6 +293,11 @@ class ServerHello(HandshakeMsg):
             w.add(7, 2)
             w.add(1, 2)
             w.add(self.certificate_type, 1)
+
+        if encoded_next_protos_advertised is not None:
+            w.add(13172, 2)
+            w.add(len(encoded_next_protos_advertised), 2)
+            w.addFixSeq(encoded_next_protos_advertised, 1)
 
         return HandshakeMsg.postWrite(self, w, trial)
 
@@ -492,6 +525,7 @@ class CertificateVerify(HandshakeMsg):
         return self
 
     def write(self, trial=False):
+        w.add(self.type,1)
         w = HandshakeMsg.preWrite(self, HandshakeType.certificate_verify,
                                   trial)
         w.addVarSeq(self.signature, 1, 2)
@@ -515,6 +549,27 @@ class ChangeCipherSpec(Msg):
     def write(self, trial=False):
         w = Msg.preWrite(self, trial)
         w.add(self.type,1)
+        return Msg.postWrite(self, w, trial)
+
+class NextProtocol(Msg):
+    def __init__(self):
+        self.contentType = ContentType.handshake
+        self.next_proto = None
+
+    def create(self, next_proto):
+        self.next_proto = next_proto
+
+    def parse(self, p):
+        p.startLengthCheck(3)
+        self.next_proto = p.getVarBytes(1)
+        _ = p.getVarBytes(1)
+        p.stopLengthCheck()
+        return self
+
+    def write(self, trial=False):
+        w = Msg.preWrite(self, HandshakeMsg.next_protocol, trial)
+        w.addVarSeq(self.next_proto, 1, 1)
+        w.addVarSeq('\x00' * 32, 1, 32 - ((len(self.next_proto) + 2) % 32));
         return Msg.postWrite(self, w, trial)
 
 
@@ -559,3 +614,4 @@ class ApplicationData(Msg):
 
     def write(self):
         return self.bytes
+
