@@ -8,8 +8,7 @@ from constants import *
 from X509 import X509
 from X509CertChain import X509CertChain
 
-import sha
-import md5
+import hashlib
 
 class RecordHeader3:
     def __init__(self):
@@ -164,7 +163,7 @@ class ClientHello(HandshakeMsg):
                 while soFar != totalExtLength:
                     extType = p.get(2)
                     extLength = p.get(2)
-                    if extType == 6:
+                    if extType == ClientHelloExtension.srp:
                         self.srp_username = bytesToString(p.getVarBytes(1))
                     elif extType == 7:
                         self.certificate_types = p.getVarList(1, 1)
@@ -200,7 +199,7 @@ class ClientHello(HandshakeMsg):
             w.add(len(self.certificate_types)+1, 2)
             w.addVarSeq(self.certificate_types, 1, 1)
         if self.srp_username:
-            w.add(6, 2)
+            w.add(ClientHelloExtension.srp, 2)
             w.add(len(self.srp_username)+1, 2)
             w.addVarSeq(stringToBytes(self.srp_username), 1, 1)
 
@@ -438,7 +437,7 @@ class ServerKeyExchange(HandshakeMsg):
         try:
             bytes = clientRandom + serverRandom + self.write()[4:]
             s = bytesToString(bytes)
-            return stringToBytes(md5.md5(s).digest() + sha.sha(s).digest())
+            return stringToBytes(hashlib.md5(s).digest() + hashlib.sha1(s).digest())
         finally:
             self.cipherSuite = oldCipherSuite
 

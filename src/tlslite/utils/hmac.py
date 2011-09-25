@@ -29,23 +29,23 @@ class HMAC:
         digestmod: A module supporting PEP 247. Defaults to the md5 module.
         """
         if digestmod is None:
-            import md5
-            digestmod = md5
+            import hashlib
+            digestmod = hashlib.md5
 
         if key == None: #TREVNEW - for faster copying
             return      #TREVNEW
 
         self.digestmod = digestmod
-        self.outer = digestmod.new()
-        self.inner = digestmod.new()
-        self.digest_size = digestmod.digest_size
+        self.outer = digestmod()
+        self.inner = digestmod()
+        self.digest_size = digestmod().digest_size
 
         blocksize = 64
         ipad = "\x36" * blocksize
         opad = "\x5C" * blocksize
 
         if len(key) > blocksize:
-            key = digestmod.new(key).digest()
+            key = digestmod(key).digest()
 
         key = key + chr(0) * (blocksize - len(key))
         self.outer.update(_strxor(key, opad))
