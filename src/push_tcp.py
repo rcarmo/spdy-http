@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 
+import traceback
+
 """
 push-based asynchronous TCP
 
@@ -121,7 +123,7 @@ To stop it, just stop it;
 
 __author__ = "Mark Nottingham <mnot@mnot.net>"
 __copyright__ = """\
-Copyright (c) 2008-2010 Mark Nottingham
+Copyright (c) 2008-2009 Mark Nottingham
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -142,13 +144,15 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 """
 
-import asyncore
-import bisect
-import errno
-import os
 import sys
 import socket
+import ssl
+import errno
+import asyncore
 import time
+import bisect
+import logging
+import select
 
 try:
     import event      # http://www.monkey.org/~dugsong/pyevent/
@@ -158,96 +162,130 @@ except ImportError:
 class _TcpConnection(asyncore.dispatcher):
     "Base class for a TCP connection."
     write_bufsize = 16
-    read_bufsize = 1024 * 16
-    def __init__(self, sock, host, port):
+    read_bufsize = 1024 * 4
+    def __init__(self,
+                 sock,
+                 is_server,
+                 host,
+                 port,
+                 use_ssl,
+                 certfile,
+                 keyfile,
+                 connect_error_handler=None):
+        self.use_ssl = use_ssl
         self.socket = sock
+        if is_server:
+            if self.use_ssl: 
+                try:
+                    self.socket = ssl.wrap_socket(sock,
+                                                  server_side=True,
+                                                  certfile=certfile,
+                                                  keyfile=keyfile,
+                                                  do_handshake_on_connect=False)
+                    self.socket.do_handshake()
+                except ssl.SSLError, err:
+                    if err.args[0] == ssl.SSL_ERROR_WANT_READ:
+                        select.select([self.socket], [], [])
+                    elif err.args[0] == ssl.SSL_ERROR_WANT_WRITE:
+                        select.select([], [self.socket], [])
+                    else:
+                        raise
         self.host = host
         self.port = port
+        self.connect_error_handler = connect_error_handler
         self.read_cb = None
         self.close_cb = None
         self._close_cb_called = False
         self.pause_cb = None  
-        self.tcp_connected = True # we assume a connected socket
+        self.tcp_connected = True # always handed a connected socket (we assume)
         self._paused = False # TODO: should be paused by default
         self._closing = False
         self._write_buffer = []
         if event:
-            self._revent = event.read(sock, self.handle_read)
-            self._wevent = event.write(sock, self.handle_write)
+            self._revent = event.read(self.socket, self.handle_read)
+            self._wevent = event.write(self.socket, self.handle_write)
         else: # asyncore
-            asyncore.dispatcher.__init__(self, sock)
-
-    def __repr__(self):
-        status = [self.__class__.__module__+"."+self.__class__.__name__]
-        if self.tcp_connected:
-            status.append('connected')
-        status.append('%s:%s' % (self.host, self.port))
-        if event:
-            status.append('event-based')
-        if self._paused:
-            status.append('paused')
-        if self._closing:
-            status.append('closing')
-        if self._close_cb_called:
-            status.append('close cb called')
-        if self._write_buffer:
-            status.append('%s write buffered' % len(self._write_buffer))
-        return "<%s at %#x>" % (", ".join(status), id(self))
-
-    def handle_connect(self): # asyncore
-        pass
-        
+            asyncore.dispatcher.__init__(self, self.socket)
+    
     def handle_read(self):
         """
         The connection has data read for reading; call read_cb
         if appropriate.
         """
-        try:
-            data = self.socket.recv(self.read_bufsize)
-        except socket.error, why:
-            if why[0] in [errno.EBADF, errno.ECONNRESET, errno.ESHUTDOWN, 
-                          errno.ECONNABORTED, errno.ECONNREFUSED, 
-                          errno.ENOTCONN, errno.EPIPE]:
-                self.conn_closed()
-                return
-            else:
-                raise
-        if data == "":
-            self.conn_closed()
-        else:
-            self.read_cb(data)
-            if event:
-                if self.read_cb and self.tcp_connected and not self._paused:
-                    return self._revent
-        
-    def handle_write(self):
-        "The connection is ready for writing; write any buffered data."
-        if len(self._write_buffer) > 0:
-            data = "".join(self._write_buffer)
+        # We want to read as much data as we can, loop here until we get EAGAIN
+        while True:
             try:
-                sent = self.socket.send(data)
+                data = self.recv(self.read_bufsize)
             except socket.error, why:
-                if why[0] == errno.EWOULDBLOCK:
-                    return
-                elif why[0] in [errno.EBADF, errno.ECONNRESET, 
-                                errno.ESHUTDOWN, errno.ECONNABORTED,
-                                errno.ECONNREFUSED, errno.ENOTCONN, 
-                                errno.EPIPE]:
+                if why[0] in [errno.EBADF, errno.ECONNRESET, errno.EPIPE, errno.ETIMEDOUT]:
                     self.conn_closed()
+                    return
+                elif why[0] in [errno.ECONNREFUSED, errno.ENETUNREACH] and self.connect_error_handler:
+                    self.tcp_connected = False
+                    self.connect_error_handler(why[0])
+                    return
+                elif why[0] in [errno.EAGAIN]:
                     return
                 else:
                     raise
-            if sent < len(data):
-                self._write_buffer = [data[sent:]]
+
+            if data == "":
+                self.conn_closed()
+                return
             else:
-                self._write_buffer = []
+                self.read_cb(data)
+                if event:
+                    if self.read_cb and self.tcp_connected and not self._paused:
+                        return self._revent
+            return
+        
+    def handle_write(self):
+        "The connection is ready for writing; write any buffered data."
+        try:
+            # This write could be more efficient and coalesce multiple elements
+            # of the _write_buffer into a single write.  However, the stock
+            # ssl library with python needs us to pass the same buffer back
+            # after a socket.send() returns 0 bytes.  To fix this, we need
+            # to use the SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER, but this can
+            # only be done on the context in the ssl.c code.  So, we work
+            # around this problem by not coalescing buffers.  Repeated calls
+            # to handle_write after SSL errors always hand the same buffer
+            # to the SSL library, and it works.
+            while len(self._write_buffer):
+                data = self._write_buffer[0]
+                sent = self.socket.send(self._write_buffer[0])
+                if sent == len(self._write_buffer[0]):
+                    self._write_buffer = self._write_buffer[1:]
+                else:
+                    # Only did a partial write.
+                    self._write_buffer[0] = self._write_buffer[0][sent:]
+        except ssl.SSLError, err:
+            logging.error(str(self.socket) + "SSL Write error: " + str(err))
+            if err.args[0] == ssl.SSL_ERROR_WANT_READ:
+                select.select([self.socket], [], [])
+            elif err.args[0] == ssl.SSL_ERROR_WANT_WRITE:
+                select.select([], [self.socket], [])
+            else:
+                raise
+        except socket.error, why:
+            if why[0] in [errno.EBADF, errno.ECONNRESET, errno.EPIPE, errno.ETIMEDOUT]:
+                self.conn_closed()
+                return
+            elif why[0] in [errno.ECONNREFUSED, errno.ENETUNREACH] and \
+              self.connect_error_handler:
+                self.tcp_connected = False
+                self.connect_error_handler(why[0])
+                return
+            elif why[0] in [errno.EAGAIN]:
+                pass
+            else:
+                raise
         if self.pause_cb and len(self._write_buffer) < self.write_bufsize:
             self.pause_cb(False)
         if self._closing:
             self.close()
         if event:
-            if self.tcp_connected \
-            and (len(self._write_buffer) > 0 or self._closing):
+            if self.tcp_connected and (len(self._write_buffer) > 0 or self._closing):
                 return self._wevent
 
     def conn_closed(self):
@@ -255,6 +293,7 @@ class _TcpConnection(asyncore.dispatcher):
         The connection has been closed by the other side. Do local cleanup
         and then call close_cb.
         """
+        self.socket.close()
         self.tcp_connected = False
         if self._close_cb_called:
             return
@@ -269,8 +308,23 @@ class _TcpConnection(asyncore.dispatcher):
 
     def write(self, data):
         "Write data to the connection."
-#        assert not self._paused
-        self._write_buffer.append(data)
+	# assert not self._paused
+
+        # For SSL we want to write small chunks so that we don't end up with
+        # multi-packet spans of data.  Multi-packet spans leads to increased
+        # latency because all packets must be received before any of the
+        # packets can be delivered to the application layer.
+        use_small_chunks = True
+        if use_small_chunks:
+            data_length = len(data)
+            start_pos = 0
+            while data_length > 0:
+               chunk_length = min(data_length, 1460)
+               self._write_buffer.append(data[start_pos:start_pos + chunk_length])
+               start_pos += chunk_length
+               data_length -= chunk_length
+        else:
+          self._write_buffer.append(data)
         if self.pause_cb and len(self._write_buffer) > self.write_bufsize:
             self.pause_cb(True)
         if event:
@@ -297,18 +351,14 @@ class _TcpConnection(asyncore.dispatcher):
         if len(self._write_buffer) > 0:
             self._closing = True
         else:
+            self.socket.close()
             self.tcp_connected = False
-            if event:
-                if self._revent.pending():
-                    self._revent.delete()
-                if self._wevent.pending():
-                    self._wevent.delete()
-                self.socket.close()
-            else:
-                asyncore.dispatcher.close(self)
 
     def readable(self):
         "asyncore-specific readable method"
+        if isinstance(self.socket, ssl.SSLSocket):
+            while self.socket.pending() > 0:
+                self.handle_read_event()
         return self.read_cb and self.tcp_connected and not self._paused
     
     def writable(self):
@@ -317,66 +367,72 @@ class _TcpConnection(asyncore.dispatcher):
             (len(self._write_buffer) > 0 or self._closing)
 
     def handle_error(self):
-        """
-        asyncore-specific misc error method.
-        """
-        raise
+        "asyncore-specific error method"
+        if self.use_ssl:
+            err = sys.exc_info()
+            if issubclass(err[0], socket.error):
+                self.connect_error_handler(err[0])
+            else:
+                raise
+        else:
+            # Treat the error as a connection closed.
+            t, err, tb = sys.exc_info()
+            logging.error("TCP error!" + str(err))
+            self.conn_closed()
 
-
-def create_server(host, port, conn_handler):
-    """Listen to host:port and send connections to conn_handler."""
-    sock = server_listen(host, port)
-    attach_server(host, port, sock, conn_handler)
-
-def server_listen(host, port):
-    "Return a socket listening to host:port."
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setblocking(0)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((host, port))
-    sock.listen(socket.SOMAXCONN)
-    return sock
-    
-class attach_server(asyncore.dispatcher):
-    "Attach a server to a listening socket."
-    def __init__(self, host, port, sock, conn_handler):
+class create_server(asyncore.dispatcher):
+    "An asynchrnous TCP server."
+    def __init__(self, host, port, use_ssl, certfile, keyfile, conn_handler):
         self.host = host
         self.port = port
+        self.use_ssl = use_ssl
+        self.certfile = certfile
+        self.keyfile = keyfile
         self.conn_handler = conn_handler
         if event:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setblocking(0)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, port))
+            sock.listen(socket.SOMAXCONN)
             event.event(self.handle_accept, handle=sock,
                         evtype=event.EV_READ|event.EV_PERSIST).add()
         else: # asyncore
-            asyncore.dispatcher.__init__(self, sock=sock)
-            self.accepting = True
+            asyncore.dispatcher.__init__(self)
+            self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.set_reuse_addr()
+            self.bind((host, port))
+            self.listen(socket.SOMAXCONN) # TODO: set SO_SNDBUF, SO_RCVBUF
 
     def handle_accept(self, *args):
-        try:
-            if event:
-                conn, addr = args[1].accept()
-            else: # asyncore
-                conn, addr = self.accept()
-        except TypeError: 
-            # sometimes accept() returns None if we have 
-            # multiple processes listening
-            return
-        tcp_conn = _TcpConnection(conn, self.host, self.port)
-        tcp_conn.read_cb, tcp_conn.close_cb, tcp_conn.pause_cb = \
-            self.conn_handler(tcp_conn)
+        if event:
+            conn, addr = args[1].accept()
+        else: # asyncore
+            conn, addr = self.accept()
+        tcp_conn = _TcpConnection(conn,
+                                  True,
+                                  self.host,
+                                  self.port,
+                                  self.use_ssl,
+                                  self.certfile,
+                                  self.keyfile,
+                                  self.handle_error)
+        tcp_conn.read_cb, tcp_conn.close_cb, tcp_conn.pause_cb = self.conn_handler(tcp_conn)
 
-    def handle_error(self):
-        stop() # FIXME: handle unscheduled errors more gracefully
-        raise
+    def handle_error(self, err=None):
+        #raise AssertionError, "this (%s) should never happen for a server." % err
+        pass
+
 
 class create_client(asyncore.dispatcher):
     "An asynchronous TCP client."
-    def __init__(self, host, port, conn_handler, 
-        connect_error_handler, connect_timeout=None):
+    def __init__(self, host, port, conn_handler, connect_error_handler, timeout=None):
         self.host = host
         self.port = port
         self.conn_handler = conn_handler
         self.connect_error_handler = connect_error_handler
         self._timeout_ev = None
+        self._conn_handled = False
         self._error_sent = False
         # TODO: socket.getaddrinfo(); needs to be non-blocking.
         if event:
@@ -384,75 +440,49 @@ class create_client(asyncore.dispatcher):
             sock.setblocking(0)
             event.write(sock, self.handle_connect, sock).add()
             try:
-                # FIXME: check for DNS errors, etc.
-                err = sock.connect_ex((host, port))
+                err = sock.connect_ex((host, port)) # FIXME: check for DNS errors, etc.
             except socket.error, why:
-                self.handle_conn_error()
-                return
-            except socket.gaierror, why:
-                self.handle_conn_error()
+                self.handle_error(why)
                 return
             if err != errno.EINPROGRESS: # FIXME: others?
-                self.handle_conn_error((err, os.strerror(err)))
-                return
+                self.handle_error(err)
         else: # asyncore
             asyncore.dispatcher.__init__(self)
             self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
-                self.connect((host, port)) 
-                # exceptions should be caught by handle_error
+                self.connect((host, port))
             except socket.error, why:
-                self.handle_conn_error()
-                return
-            except socket.gaierror, why:
-                self.handle_conn_error()
-                return
-        if connect_timeout:
-            self._timeout_ev = schedule(connect_timeout,
-                            self.connect_error_handler, 
-                            (errno.ETIMEDOUT, os.strerror(errno.ETIMEDOUT))
-            )
+                self.handle_error(why[0])
+        if timeout:
+            to_err = errno.ETIMEDOUT
+            self._timeout_ev = schedule(timeout, self.handle_error, to_err)
 
     def handle_connect(self, sock=None):
         if self._timeout_ev:
             self._timeout_ev.delete()
-        if self._error_sent:
-            return
         if sock is None: # asyncore
             sock = self.socket
-        tcp_conn = _TcpConnection(sock, self.host, self.port)
-        tcp_conn.read_cb, tcp_conn.close_cb, tcp_conn.pause_cb = \
-            self.conn_handler(tcp_conn)
+        tcp_conn = _TcpConnection(sock,
+                                  False,
+                                  self.host,
+                                  self.port,
+                                  False,     # use_ssl
+                                  self.certfile,
+                                  self.keyfile,
+                                  self.handle_error)
+        tcp_conn.read_cb, tcp_conn.close_cb, tcp_conn.pause_cb = self.conn_handler(tcp_conn)
 
-    def handle_read(self): # asyncore
+    def handle_write(self):
         pass
 
-    def handle_write(self): # asyncore
-        pass
-
-    def handle_conn_error(self, ex_value=None):
-        if ex_value is None:
-            ex_type, ex_value = sys.exc_info()[:2]
-        else:
-            ex_type = socket.error
-        if ex_type in [socket.error, socket.gaierror]:
-            if ex_value[0] == errno.ECONNREFUSED:
-                return # OS will retry
-            if self._timeout_ev:
-                self._timeout_ev.delete()
-            if self._error_sent:
-                return
-            elif self.connect_error_handler:
-                self._error_sent = True
-                self.connect_error_handler(ex_value)
-        else:
-            if self._timeout_ev:
-                self._timeout_ev.delete()
-            raise
-    
-    def handle_error(self):
-        stop() # FIXME: handle unscheduled errors more gracefully
-        raise
+    def handle_error(self, err=None):
+        if self._timeout_ev:
+            self._timeout_ev.delete()
+        if not self._error_sent:
+            self._error_sent = True
+            if err == None:
+                t, err, tb = sys.exc_info()
+            self.connect_error_handler(self.host, self.port, err)
 
 
 # adapted from Medusa
@@ -462,28 +492,21 @@ class _AsyncoreLoop:
         self.events = []
         self.num_channels = 0
         self.max_channels = 0
-        self.timeout = 1
-        self.granularity = 1
+        self.timeout = 0.001    # 1ms
+        self.granularity = 0.001   # 1ms
         self.socket_map = asyncore.socket_map
-        self._now = None
-        self._running = False
 
     def run(self):
         "Start the loop."
         last_event_check = 0
-        self._running = True
-        while (self.socket_map or self.events) and self._running:
-            self._now = time.time()
-            if (self._now - last_event_check) >= self.granularity:
-                last_event_check = self._now
+        while self.socket_map or self.events:
+            now = time.time()
+            if (now - last_event_check) >= self.granularity:
+                last_event_check = now
                 for event in self.events:
                     when, what = event
-                    if self._now >= when:
-                        try:
-                            self.events.remove(event)
-                        except ValueError: 
-                            # a previous event may have removed this one.
-                            continue
+                    if now >= when:
+                        self.events.remove(event)
                         what()
                     else:
                         break
@@ -492,25 +515,19 @@ class _AsyncoreLoop:
             self.num_channels = n
             if n > self.max_channels:
                 self.max_channels = n
-            asyncore.poll(self.timeout) # TODO: use poll2 when available
-            
+            asyncore.poll(self.timeout)
+
     def stop(self):
         "Stop the loop."
-        self.socket_map.clear()
+        self.socket_map = {}
         self.events = []
-        self._now = None
-        self._running = False
             
-    def time(self):
-        "Return the current time (to avoid a system call)."
-        return self._now or time.time()
-
     def schedule(self, delta, callback, *args):
         "Schedule callable callback to be run in delta seconds with *args."
         def cb():
             if callback:
                 callback(*args)
-        new_event = (self.time() + delta, cb)
+        new_event = (time.time() + delta, cb)
         events = self.events
         bisect.insort(events, new_event)
         class event_holder:
@@ -525,25 +542,12 @@ class _AsyncoreLoop:
                         pass
         return event_holder()
 
-_event_running = False
-def _event_run(*args):
-    _event_running = True
-    event.dispatch(*args)
-
-def _event_stop(*args):
-    _event_running = False
-    event.abort(*args)
-
 if event:
     schedule = event.timeout
-    run = _event_run
-    stop =  _event_stop
-    now = time.time
-    running = _event_running
+    run = event.dispatch
+    stop =  event.abort
 else:
     _loop = _AsyncoreLoop()
     schedule = _loop.schedule
     run = _loop.run
     stop = _loop.stop
-    now = _loop.time
-    running = _loop._running

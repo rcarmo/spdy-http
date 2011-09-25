@@ -9,7 +9,7 @@ for the parsing portions of the client and server.
 
 __author__ = "Mark Nottingham <mnot@mnot.net>"
 __copyright__ = """\
-Copyright (c) 2008-2010 Mark Nottingham
+Copyright (c) 2008-2009 Mark Nottingham
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -45,12 +45,11 @@ idempotent_methods = ['GET', 'HEAD', 'PUT', 'DELETE', 'OPTIONS', 'TRACE']
 safe_methods = ['GET', 'HEAD', 'OPTIONS', 'TRACE']
 no_body_status = ['100', '101', '204', '304']
 hop_by_hop_hdrs = ['connection', 'keep-alive', 'proxy-authenticate', 
-                   'proxy-authorization', 'te', 'trailers', 
-                   'transfer-encoding', 'upgrade', 'proxy-connection']
+                   'proxy-authorization', 'te', 'trailers', 'transfer-encoding', 
+                   'upgrade', 'proxy-connection']
 
 
-from error import ERR_EXTRA_DATA, ERR_CHUNK, ERR_BODY_FORBIDDEN, \
-    ERR_TOO_MANY_MSGS
+from error import ERR_EXTRA_DATA, ERR_CHUNK, ERR_BODY_FORBIDDEN
 
 def dummy(*args, **kw):
     "Dummy method that does nothing; useful to ignore a callback."
@@ -99,8 +98,6 @@ class HttpMessageHandler:
     """
 
     def __init__(self):
-        self.input_header_length = 0
-        self.input_transfer_length = 0
         self._input_buffer = ""
         self._input_state = WAITING
         self._input_delimit = None
@@ -110,8 +107,7 @@ class HttpMessageHandler:
 
     # input-related methods
 
-    def _input_start(self, top_line, hdr_tuples, conn_tokens, 
-                     transfer_codes, content_length):
+    def _input_start(self, top_line, hdr_tuples, conn_tokens, transfer_codes, content_length):
         """
         Take the top set of headers from the input stream, parse them
         and queue the request to be processed by the application.
@@ -139,34 +135,26 @@ class HttpMessageHandler:
         making the appropriate calls.
         """
         if self._input_buffer != "":
-            # will need to move to a list if writev comes around
-            instr = self._input_buffer + instr 
+            instr = self._input_buffer + instr # will need to move to a list if writev comes around
             self._input_buffer = ""
         if self._input_state == WAITING:
             if hdr_end.search(instr): # found one
                 rest = self._parse_headers(instr)
-                try:
-                    self._handle_input(rest)
-                except RuntimeError:
-                    self._input_error(ERR_TOO_MANY_MSGS)
+                self._handle_input(rest)
             else: # partial headers; store it and wait for more
                 self._input_buffer = instr
         elif self._input_state == HEADERS_DONE:
             try:
-                input_parse = getattr(self, '_handle_%s' %
-                                      self._input_delimit)
+                getattr(self, '_handle_%s' % self._input_delimit)(instr)
             except AttributeError:
-                raise Exception, "Unknown input delimiter %s" % \
-                                 self._input_delimit
-            input_parse(instr)
+                raise Exception, "Unknown input delimiter %s" % self._input_delimit
         else:
             raise Exception, "Unknown state %s" % self._input_state
 
     def _handle_nobody(self, instr):
         "Handle input that shouldn't have a body."
         if instr:
-            # FIXME: will not work with pipelining
-            self._input_error(ERR_BODY_FORBIDDEN, instr) 
+            self._input_error(ERR_BODY_FORBIDDEN, instr) # FIXME: will not work with pipelining
         else:
             self._input_end()
         self._input_state = WAITING
@@ -174,7 +162,6 @@ class HttpMessageHandler:
 
     def _handle_close(self, instr):
         "Handle input where the body is delimited by the connection closing."
-        self.input_transfer_length += len(instr)
         self._input_body(instr)
 
     def _handle_chunked(self, instr):
@@ -182,8 +169,7 @@ class HttpMessageHandler:
         while instr:
             if self._input_body_left < 0: # new chunk
                 instr = self._handle_chunk_new(instr)
-            elif self._input_body_left > 0: 
-                # we're in the middle of reading a chunk
+            elif self._input_body_left > 0: # we're in the middle of reading a chunk
                 instr = self._handle_chunk_body(instr)
             elif self._input_body_left == 0: # body is done
                 instr = self._handle_chunk_done(instr)
@@ -210,25 +196,19 @@ class HttpMessageHandler:
         except ValueError:
             self._input_error(ERR_CHUNK, chunk_size)
             return # blow up if we can't process a chunk.
-        self.input_transfer_length += len(instr) - len(rest)        
         return rest
 
     def _handle_chunk_body(self, instr):
         if self._input_body_left < len(instr): # got more than the chunk
             this_chunk = self._input_body_left
             self._input_body(instr[:this_chunk])
-            self.input_transfer_length += this_chunk
             self._input_body_left = -1
             return instr[this_chunk+2:] # +2 consumes the CRLF
-        elif self._input_body_left == len(instr): 
-            # got the whole chunk exactly
+        elif self._input_body_left == len(instr): # got the whole chunk exactly
             self._input_body(instr)
-            self.input_transfer_length += self._input_body_left
             self._input_body_left = -1
-        else: 
-            # got partial chunk
+        else: # got partial chunk
             self._input_body(instr)
-            self.input_transfer_length += len(instr)
             self._input_body_left -= len(instr)
 
     def _handle_chunk_done(self, instr):
@@ -250,18 +230,15 @@ class HttpMessageHandler:
             "message counting problem (%s)" % self._input_body_left
         # process body
         if self._input_body_left <= len(instr): # got it all (and more?)
-            self.input_transfer_length += self._input_body_left
             self._input_body(instr[:self._input_body_left])
             self._input_state = WAITING
             if instr[self._input_body_left:]:
                 # This will catch extra input that isn't on packet boundaries.
-                self._input_error(ERR_EXTRA_DATA,
-                                  instr[self._input_body_left:])
+                self._input_error(ERR_EXTRA_DATA, instr[self._input_body_left:])
             else:
                 self._input_end()
         else: # got some of it
             self._input_body(instr)
-            self.input_transfer_length += len(instr)
             self._input_body_left -= len(instr)
 
     def _parse_headers(self, instr):
@@ -271,7 +248,6 @@ class HttpMessageHandler:
         to kick off processing.
         """
         top, rest = hdr_end.split(instr, 1)
-        self.input_header_length = len(top)
         hdr_lines = lws.sub(" ", top).splitlines()   # Fold LWS
         try:
             top_line = hdr_lines.pop(0)
@@ -294,8 +270,7 @@ class HttpMessageHandler:
             if f_name == "connection":
                 conn_tokens += [v.strip().lower() for v in f_val.split(',')]
             elif f_name == "transfer-encoding": # FIXME: parameters
-                transfer_codes += [v.strip().lower() for \
-                                   v in f_val.split(',')]
+                transfer_codes += [v.strip().lower() for v in f_val.split(',')]
             elif f_name == "content-length":
                 if content_length != None:
                     continue # ignore any C-L past the first. 
@@ -313,7 +288,7 @@ class HttpMessageHandler:
 
         try:
             allows_body = self._input_start(top_line, hdr_tuples, 
-                        conn_tokens, transfer_codes, content_length)
+                                    conn_tokens, transfer_codes, content_length)
         except ValueError: # parsing error of some kind; abort.
             return ""
                                 
@@ -386,6 +361,4 @@ class HttpMessageHandler:
         elif self._output_delimit == CLOSE:
             self._tcp_conn.close() # FIXME: abstract out?
         else:
-            raise AssertionError, "Unknown request delimiter %s" % \
-                                  self._output_delimit
-        self._output_state = WAITING
+            raise AssertionError, "Unknown request delimiter %s" % self._output_delimit
