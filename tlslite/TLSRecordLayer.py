@@ -697,6 +697,8 @@ class TLSRecordLayer:
                                             self.version).parse(p)
                 elif subType == HandshakeType.finished:
                     yield Finished(self.version).parse(p)
+                elif subType == HandshakeType.next_protocol:
+                    yield NextProtocol().parse(p)
                 else:
                     raise AssertionError()
 
@@ -1050,7 +1052,7 @@ class TLSRecordLayer:
         for result in self._sendMsg(finished):
             yield result
 
-    def _getFinished(self):
+    def _getFinished(self, expect_next_protocol=False):
         #Get and check ChangeCipherSpec
         for result in self._getMsg(ContentType.change_cipher_spec):
             if result in (0,1):
@@ -1064,6 +1066,18 @@ class TLSRecordLayer:
 
         #Switch to pending read state
         self._changeReadState()
+        if expect_next_protocol:
+            for result in self._getMsg(ContentType.handshake, HandshakeType.next_protocol):
+                if result in (0,1):
+                    yield result
+            if result is None:
+                for result in self._sendError(AlertDescription.unexpected_message,
+                                              "Didn't get NextProtocol message"):
+                    yield result
+
+            self.next_proto = result.next_proto
+        else:
+            self.next_proto = None
 
         #Calculate verification data
         verifyData = self._calcFinished(False)
